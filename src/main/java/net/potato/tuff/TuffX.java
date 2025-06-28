@@ -1,4 +1,4 @@
-package tf.tuff.myplugin;
+package net.potato.tuff;
 
 import org.bukkit.ChatColor;
 import org.bukkit.command.Command;

@@ -1,4 +1,4 @@
-package com.example.myplugin;
+package net.potato.tuff;
 
 import java.util.Objects;
 import java.util.UUID;

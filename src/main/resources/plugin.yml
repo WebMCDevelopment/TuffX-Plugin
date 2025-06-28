@@ -1,6 +1,6 @@
 name: TuffX
 version: 1.0
-main: tf.tuff.myplugin.TuffX
+main: net.potato.tuff.TuffX
 author: Potato
 api-version: 1.20
 

@@ -1,8 +1,9 @@
-com\example\myplugin\TuffX$1.class
-com\example\myplugin\ChunkSectionKey.class
-com\example\myplugin\TuffX.class
-com\example\myplugin\TuffX$3$1.class
-com\example\myplugin\TuffX$3.class
-com\example\myplugin\TuffX$2.class
-com\example\myplugin\LegacyBlockIds.class
-com\example\myplugin\LegacyBlockIdManager.class
+net\potato\tuff\TuffX$3.class
+net\potato\tuff\ChunkSectionKey.class
+net\potato\tuff\TuffX$ChunkSectionKey.class
+net\potato\tuff\LegacyBlockIds.class
+net\potato\tuff\TuffX$3$1.class
+net\potato\tuff\LegacyBlockIdManager.class
+net\potato\tuff\TuffX$1.class
+net\potato\tuff\TuffX.class
+net\potato\tuff\TuffX$2.class

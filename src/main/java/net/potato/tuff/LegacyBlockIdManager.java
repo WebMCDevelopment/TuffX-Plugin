@@ -1,4 +1,4 @@
-package com.example.myplugin;
+package net.potato.tuff;
 
 import org.bukkit.Material;
 import org.bukkit.plugin.Plugin;

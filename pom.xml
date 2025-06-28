@@ -4,7 +4,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <!-- Project Information -->
-    <groupId>com.example.myplugin</groupId>
+    <groupId>net.potato.tuff</groupId>
     <artifactId>TuffX</artifactId>
     <version>1.0.1-SNAPSHOT</version>
     <packaging>jar</packaging>
