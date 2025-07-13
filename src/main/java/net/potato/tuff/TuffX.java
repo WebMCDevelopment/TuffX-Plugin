@@ -25,6 +25,7 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.PluginMessageListener;
 import org.bukkit.scheduler.BukkitRunnable;
+import java.util.Optional;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -47,6 +48,7 @@ import org.bukkit.event.EventPriority;
 
 import org.bukkit.ChunkSnapshot;
 import org.bukkit.Chunk;
+import org.bukkit.entity.Entity;
 
 public class TuffX extends JavaPlugin implements Listener, PluginMessageListener, TabCompleter {
 
@@ -273,13 +275,56 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         }
     }
 
-    private byte[] createBlockUpdatePayload(Location loc, Material newMaterial) {
+    /*private byte[] createBlockUpdatePayload(Location loc, Material newMaterial) {
         try (ByteArrayOutputStream bout = new ByteArrayOutputStream(); DataOutputStream out = new DataOutputStream(bout)) {
+            World world = player.getWorld();
             out.writeUTF("block_update");
             out.writeInt(loc.getBlockX());
             out.writeInt(loc.getBlockY());
             out.writeInt(loc.getBlockZ());
-            out.writeShort(LegacyBlockIdManager.getLegacyShort(newMaterial));
+            //out.writeShort(LegacyBlockIdManager.getLegacyShort(newMaterial));
+            Block block = world.getBlockAt(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
+            Material type = block.getType();
+            byte data = block.getData(); 
+            if (type == null) type = Material.AIR;
+
+            //short legacyId = LegacyBlockIdManager.getLegacyShort(type);
+            //out.writeShort(legacyId);
+
+            //Material type = snapshot.getBlockType(x, worldY, z);
+            int legacyId = LegacyBlockIds.getId(type.name().toLowerCase());
+            int legacyMeta = data & 0xF;
+            short combined = (short)((legacyMeta << 12) | (legacyId & 0xFFF));
+            out.writeShort(combined);
+            return bout.toByteArray();
+        } catch (IOException e) {
+            if (!isMuted) getLogger().severe("Failed to create block update payload! " + e.getMessage());
+            return new byte[0];
+        }
+    }*/
+
+    private byte[] createBlockUpdatePayload(Location loc, Material newMaterial) {
+        try (ByteArrayOutputStream bout = new ByteArrayOutputStream();
+            DataOutputStream out = new DataOutputStream(bout)) {
+            
+            out.writeUTF("block_update");
+            out.writeInt(loc.getBlockX());
+            out.writeInt(loc.getBlockY());
+            out.writeInt(loc.getBlockZ());
+            
+            World world = loc.getWorld();
+            if (world == null) throw new IOException("World is null for location!");
+            
+            Block block = world.getBlockAt(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
+            Material type = block.getType();
+            if (type == null) type = Material.AIR;
+            
+            int legacyId = LegacyBlockIds.getId(type.name().toLowerCase());
+            int legacyMeta = 0; //data & 0xF;
+            short combined = (short) ((legacyMeta << 12) | (legacyId & 0xFFF));
+
+            out.writeShort(combined);
+            
             return bout.toByteArray();
         } catch (IOException e) {
             if (!isMuted) getLogger().severe("Failed to create block update payload! " + e.getMessage());
@@ -328,8 +373,8 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     }*/
 
     private byte[] createSectionPayload(World world, int cx, int cz, int sectionY) throws IOException {
-        Chunk chunk = world.getChunkAt(cx, cz);
-        ChunkSnapshot snapshot = chunk.getChunkSnapshot(true, false, false); // avoid lighting overhead
+        //Chunk chunk = world.getChunkAt(cx, cz);
+        //ChunkSnapshot snapshot = chunk.getChunkSnapshot(true, false, false); // avoid lighting overhead
 
         try (ByteArrayOutputStream bout = new ByteArrayOutputStream(8200);
             DataOutputStream out = new DataOutputStream(bout)) {
@@ -344,13 +389,23 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                 for (int z = 0; z < 16; z++) {
                     for (int x = 0; x < 16; x++) {
                         int worldY = baseY + y;
+                        int worldX = (cx << 4) + x;
+                        int worldZ = (cz << 4) + z;
 
-                        Material type;
-                        type = snapshot.getBlockType(x, worldY, z);
+                        Block block = world.getBlockAt(worldX, worldY, worldZ);
+                        Material type = block.getType();
+                        byte data = block.getData(); 
                         if (type == null) type = Material.AIR;
 
-                        short legacyId = LegacyBlockIdManager.getLegacyShort(type);
-                        out.writeShort(legacyId);
+                        //short legacyId = LegacyBlockIdManager.getLegacyShort(type);
+                        //out.writeShort(legacyId);
+
+                        //Material type = snapshot.getBlockType(x, worldY, z);
+                        
+                        int legacyId = LegacyBlockIds.getId(type.name().toLowerCase());
+                        int legacyMeta = data & 0xF;
+                        short combined = (short)((legacyMeta << 12) | (legacyId & 0xFFF));
+                        out.writeShort(combined);
                     }
                 }
             }
@@ -498,6 +553,59 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                     sendChunkSectionsAsync(p, chunk);
                 }
             }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onEntitySpawn(org.bukkit.event.entity.EntitySpawnEvent event) {
+        Location loc = event.getEntity().getLocation();
+        if (loc.getY() < 0) {
+            sendFakeEntitySpawn(event.getEntity());
+        }
+    }
+
+    private List<Player> getNearbyPlayers(World world, Location loc, double radius) {
+        double radiusSquared = radius * radius;
+        return world.getPlayers().stream()
+                .filter(p -> p.getLocation().distanceSquared(loc) <= radiusSquared)
+                .toList();
+    }
+
+    private void sendEntityUpdateToNearby(Entity entity, byte[] payload) {
+        Location loc = entity.getLocation();
+        double radius = 64;
+        List<Player> nearbyPlayers = getNearbyPlayers(entity.getWorld(), loc, radius);
+
+        for (Player player : nearbyPlayers) {
+            player.sendPluginMessage(this, CHANNEL, payload);
+        }
+    }
+
+    private void sendFakeEntitySpawn(org.bukkit.entity.Entity entity) {
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(bout);
+
+        try {
+            out.writeUTF("entity_spawn");
+            out.writeInt(entity.getEntityId());
+            out.writeUTF(entity.getType().name());
+            Location loc = entity.getLocation();
+            out.writeDouble(loc.getX());
+            out.writeDouble(loc.getY());
+            out.writeDouble(loc.getZ());
+            if (entity instanceof org.bukkit.entity.FallingBlock) {
+                org.bukkit.entity.FallingBlock fb = (org.bukkit.entity.FallingBlock) entity;
+                out.writeShort(LegacyBlockIdManager.getLegacyShort(fb.getBlockData().getMaterial()));
+            } else if (entity instanceof org.bukkit.entity.Item) {
+                org.bukkit.entity.Item item = (org.bukkit.entity.Item) entity;
+                ItemStack stack = item.getItemStack();
+                out.writeShort(LegacyBlockIdManager.getLegacyShort(stack.getType()));
+                out.writeInt(stack.getAmount());
+            }
+            sendEntityUpdateToNearby(entity,bout.toByteArray());
+            out.flush();
+        } catch (IOException e) {
+            getLogger().warning("Failed to send fake entity spawn: " + e.getMessage());
         }
     }
 }
