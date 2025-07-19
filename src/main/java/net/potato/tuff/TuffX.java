@@ -238,7 +238,7 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
         switch (action.toLowerCase()) {
             case "break":
-                ItemStack tool = player.getInventory().getItemInMainHand();
+                /*ItemStack tool = player.getInventory().getItemInMainHand();
                 if (player.getGameMode() == GameMode.SURVIVAL) {
                     BlockBreakEvent breakEvent = new BlockBreakEvent(block, player);
                     getServer().getPluginManager().callEvent(breakEvent);
@@ -249,7 +249,7 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                 } else {
                     block.setType(Material.AIR);
                 }
-                sendBlockUpdateToNearby(block.getLocation(), Material.AIR);
+                sendBlockUpdateToNearby(block.getLocation(), Material.AIR);*/
                 break;
 
             case "use_on_block":
@@ -262,6 +262,14 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
             case "dig_start_destroy_block":
             case "dig_abort_destroy_block":
+                break;
+
+            case "ready":
+                String welcomeMessage = "§bWelcome to the server, §e" + player.getName() + "§b!";
+                int playersOnline = getServer().getOnlinePlayers().size();
+                byte[] welcomePayload = createWelcomePayload(welcomeMessage, playersOnline);
+                player.sendPluginMessage(TuffX.this, CHANNEL, welcomePayload);
+                System.out.println("ready packet recieved, sent welcome payload");
                 break;
 
             default:
