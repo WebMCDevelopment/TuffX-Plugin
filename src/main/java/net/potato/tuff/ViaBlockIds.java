@@ -158,8 +158,8 @@ public class ViaBlockIds {
         List<ProtocolPathEntry> path = Via.getManager()
             .getProtocolManager()
             .getProtocolPath(
-                clientProtocol.getVersion(),
-                serverProtocol.getVersion()
+                serverProtocol.getVersion(),
+                clientProtocol.getVersion()
             );
 
         if (path == null) {
