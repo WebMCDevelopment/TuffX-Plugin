@@ -517,7 +517,7 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
         playerLastChunk.put(player.getUniqueId(), newChunk);
 
-        //sentSections.clear();
+        sentSections.clear();
 
         int viewDistance = getServer().getViewDistance();
         World world = player.getWorld();
