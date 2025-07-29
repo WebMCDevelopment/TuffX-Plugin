@@ -63,7 +63,6 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     public static final String CHANNEL = "eagler:below_y0";
     private final Set<ChunkSectionKey> sentSections = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private boolean isMuted = false;
-    private final Map<UUID, Chunk> playerLastChunk = new HashMap<>();
     public ViaBlockIds viablockids;
 
     @Override
@@ -74,7 +73,7 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         this.getCommand("tuffx").setExecutor(this);
         this.getCommand("tuffx").setTabCompleter(this);
         logFancyEnable();
-        this.viablockids = new ViaBlockIds(this);
+        if (this.viablockids == null) this.viablockids = new ViaBlockIds(this);
     }
 
     @Override
@@ -239,25 +238,30 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
             return;
         }
 
-        try (ByteArrayInputStream bin = new ByteArrayInputStream(message); DataInputStream in = new DataInputStream(bin)) {
-            int x = in.readInt();
-            int y = in.readInt();
-            int z = in.readInt();
-            int actionLength = in.readUnsignedByte();
-            byte[] actionBytes = new byte[actionLength];
-            in.readFully(actionBytes);
-            String action = new String(actionBytes, StandardCharsets.UTF_8);
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                try (ByteArrayInputStream bin = new ByteArrayInputStream(message); DataInputStream in = new DataInputStream(bin)) {
+                    int x = in.readInt();
+                    int y = in.readInt();
+                    int z = in.readInt();
+                    int actionLength = in.readUnsignedByte();
+                    byte[] actionBytes = new byte[actionLength];
+                    in.readFully(actionBytes);
+                    String action = new String(actionBytes, StandardCharsets.UTF_8);
 
-            new BukkitRunnable() {
-                @Override
-                public void run() {
-                    handleInteraction(player, new Location(player.getWorld(), x, y, z), action);
+                    new BukkitRunnable() {
+                        @Override
+                        public void run() {
+                            handleInteraction(player, new Location(player.getWorld(), x, y, z), action);
+                        }
+                    }.runTask(TuffX.this);
+                } catch (IOException e) {
+                    if (!isMuted)
+                        getLogger().warning("Failed to parse plugin message from " + player.getName() + ": " + e.getMessage());
                 }
-            }.runTask(this);
-        } catch (IOException e) {
-            if (!isMuted)
-                getLogger().warning("Failed to parse plugin message from " + player.getName() + ": " + e.getMessage());
-        }
+            }
+        }.runTaskAsynchronously(this);
     }
 
     private void handleInteraction(Player player, Location loc, String action) {
@@ -512,28 +516,17 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
     @EventHandler
     public void onPlayerMove(PlayerMoveEvent event) {
-        Player player = event.getPlayer();
-        Location to = event.getTo();
-        if (to == null) return;
-
-        Chunk newChunk = to.getChunk();
-        Chunk lastChunk = playerLastChunk.get(player.getUniqueId());
-
-        if (lastChunk != null &&
-            lastChunk.getX() == newChunk.getX() &&
-            lastChunk.getZ() == newChunk.getZ() &&
-            lastChunk.getWorld().equals(newChunk.getWorld())) {
+        if (event.getFrom().getChunk().equals(event.getTo().getChunk())) {
             return;
         }
 
-        playerLastChunk.put(player.getUniqueId(), newChunk);
+        Player player = event.getPlayer();
+        Chunk newChunk = event.getTo().getChunk();
+        World world = player.getWorld();
 
         sentSections.clear();
 
         int viewDistance = getServer().getViewDistance();
-        World world = player.getWorld();
-
-        //player.sendMessage("sending to all players...");
 
         for (int dx = -viewDistance; dx <= viewDistance; dx++) {
             for (int dz = -viewDistance; dz <= viewDistance; dz++) {
@@ -553,6 +546,7 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
             }
         }
     }
+
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onChunkLoad(ChunkLoadEvent event) {
