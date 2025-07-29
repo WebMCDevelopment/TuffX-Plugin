@@ -48,7 +48,7 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         }
 
         startProcessorTask();
-        getLogger().info("TuffX (Queue Model) has been enabled.");
+        logFancyEnable();
     }
 
     @Override
@@ -181,6 +181,9 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     public void onBlockBreak(BlockBreakEvent event) { if (event.getBlock().getY() < 0) sendBlockUpdateToNearby(event.getBlock().getLocation(), Material.AIR.createBlockData()); }
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBlockPlace(BlockPlaceEvent event) { if (event.getBlock().getY() < 0) sendBlockUpdateToNearby(event.getBlock().getLocation(), event.getBlock().getBlockData()); }
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockPhysics(BlockPlaceEvent event) { if (event.getBlock().getY() < 0) sendBlockUpdateToNearby(event.getBlock().getLocation(), event.getBlock().getBlockData()); }
+
 
     private void sendBlockUpdateToNearby(Location loc, BlockData data) {
         try {
@@ -200,5 +203,19 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
             out.writeShort((short) ((legacyData[1] << 12) | (legacyData[0] & 0xFFF)));
             return bout.toByteArray();
         }
+    }
+
+    private void logFancyEnable() {
+        if (isMuted) return;
+        getLogger().info("");
+        getLogger().info("████████╗██╗   ██╗███████╗ ███████╗ ██╗  ██╗");
+        getLogger().info("╚══██╔══╝██║   ██║██╔════╝ ██╔════╝ ╚██╗██╔╝");
+        getLogger().info("   ██║   ██║   ██║██████╗  ██████╗   ╚███╔╝ ");
+        getLogger().info("   ██║   ██║   ██║██╔═══╝  ██╔═══╝   ██╔██╗ ");
+        getLogger().info("   ██║   ╚██████╔╝██║      ██║      ██╔╝╚██╗");
+        getLogger().info("   ╚═╝    ╚═════╝ ╚═╝      ╚═╝      ╚═╝  ╚═╝");
+        getLogger().info("");
+        getLogger().info("Below y0 and TuffX programmed by Potato");
+        getLogger().info("Edited by coleis1op");
     }
 }
