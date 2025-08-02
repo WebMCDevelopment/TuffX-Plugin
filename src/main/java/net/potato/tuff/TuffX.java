@@ -23,11 +23,13 @@ import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 import org.bukkit.event.block.BlockPhysicsEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import java.util.logging.Level;
@@ -40,10 +42,9 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     private static final int CHUNKS_PER_TICK = 2;
 
     private final Map<UUID, Queue<Vector>> requestQueue = new ConcurrentHashMap<>();
-    private final Map<UUID, Set<Vector>> currentlyQueued = new ConcurrentHashMap<>();
     
-    private final Map<UUID, Boolean> initialLoadingPlayers = new ConcurrentHashMap<>();
-    private final Map<UUID, Integer> initialChunksToProcess = new ConcurrentHashMap<>();
+    private final Set<UUID> awaitingInitialBatch = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, AtomicInteger> initialChunksToProcess = new ConcurrentHashMap<>();
 
     private BukkitTask processorTask;
 
@@ -57,14 +58,16 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         getServer().getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
         getServer().getPluginManager().registerEvents(this, this);
         if (this.viablockids == null) this.viablockids = new ViaBlockIds(this);
-        startProcessorTask();
         logFancyEnable();
+        startProcessorTask();
     }
 
     @Override
     public void onDisable() {
         if (processorTask != null) processorTask.cancel();
         requestQueue.clear();
+        awaitingInitialBatch.clear();
+        initialChunksToProcess.clear();
         getLogger().info("TuffX has been disabled.");
     }
 
@@ -79,48 +82,48 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
             byte[] actionBytes = new byte[actionLength];
             in.readFully(actionBytes);
             String action = new String(actionBytes, StandardCharsets.UTF_8);
-            handleIncomingPacket(player, new Location(player.getWorld(), x, y, z), action, x, z);
+            handleIncomingPacket(player, new Location(player.getWorld(), x, y, z), action, x, z, in);
         } catch (IOException e) {
             getLogger().warning("Failed to parse plugin message from " + player.getName() + ": " + e.getMessage());
         }
     }
+
+    private void handleSingleChunkRequest(Player player, int chunkX, int chunkZ, UUID playerId) {
+        requestQueue.computeIfAbsent(player.getUniqueId(), k -> new ConcurrentLinkedQueue<>()).add(new Vector(chunkX, 0, chunkZ));
+    }
     
-    private void handleIncomingPacket(Player player, Location loc, String action, int chunkX, int chunkZ) {
+    private void handleIncomingPacket(Player player, Location loc, String action, int chunkX, int chunkZ, DataInputStream in) throws IOException {
         UUID playerId = player.getUniqueId();
         switch (action.toLowerCase()) {
             case "request_chunk":
-                Vector chunkVec = new Vector(chunkX, 0, chunkZ);
-                Set<Vector> queuedSet = currentlyQueued.computeIfAbsent(playerId, k -> ConcurrentHashMap.newKeySet());
+                handleSingleChunkRequest(player,chunkX,chunkZ,playerId);
+                break;
+            case "request_chunk_batch":
+                if (awaitingInitialBatch.remove(playerId)) {
+                    int batchSize = in.readInt();
+                    logDebug("Received definitive initial batch of " + batchSize + " chunks. Queueing for processing.");
 
-                if (queuedSet.add(chunkVec)) { 
-                    requestQueue.computeIfAbsent(playerId, k -> new ConcurrentLinkedQueue<>()).add(chunkVec);
+                    initialChunksToProcess.put(playerId, new AtomicInteger(batchSize));
                     
-                    if (initialLoadingPlayers.getOrDefault(playerId, false)) {
-                        initialChunksToProcess.merge(playerId, 1, Integer::sum);
-                        logDebug("Player " + player.getName() + " needs chunk " + chunkX + "," + chunkZ + ". Total initial chunks to process: " + initialChunksToProcess.get(playerId));
+                    Queue<Vector> playerQueue = requestQueue.computeIfAbsent(playerId, k -> new ConcurrentLinkedQueue<>());
+                    for (int i = 0; i < batchSize; i++) {
+                        playerQueue.add(new Vector(in.readInt(), 0, in.readInt()));
+                    }
+
+                    if (batchSize == 0) {
+                        checkIfInitialLoadComplete(player);
+                    }
+                } else {
+                    int batchSize = in.readInt();
+                    Queue<Vector> playerQueue = requestQueue.computeIfAbsent(playerId, k -> new ConcurrentLinkedQueue<>());
+                    for (int i = 0; i < batchSize; i++) {
+                        playerQueue.add(new Vector(in.readInt(), 0, in.readInt()));
                     }
                 }
                 break;
             case "ready":
-                logDebug("Player " + player.getName() + " sent READY packet. Starting initial load sequence.");
-                
-                initialLoadingPlayers.put(playerId, true);
-                initialChunksToProcess.put(playerId, 0);
-                
-                new BukkitRunnable() {
-                    @Override
-                    public void run() {
-                        if (initialLoadingPlayers.containsKey(playerId)) {
-                            initialLoadingPlayers.put(playerId, false); // Lock the state.
-                            logDebug("Player " + player.getName() + " initial chunk requests locked in at " + initialChunksToProcess.getOrDefault(playerId, 0) + " chunks.");
-                            
-                            if (initialChunksToProcess.getOrDefault(playerId, 0) == 0) {
-                                checkIfInitialLoadComplete(player);
-                            }
-                        }
-                    }
-                }.runTaskLater(this, 5L);
-
+                logDebug("Player " + player.getName() + " is READY. Awaiting first chunk batch...");
+                awaitingInitialBatch.add(player.getUniqueId());
                 player.sendPluginMessage(this, CHANNEL, createBelowY0StatusPayload(true));
                 break;
             case "use_on_block":
@@ -150,30 +153,22 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
             public void run() {
                 for (UUID playerUUID : new HashSet<>(requestQueue.keySet())) {
                     Player player = getServer().getPlayer(playerUUID);
-                    Queue<Vector> queue = requestQueue.get(playerUUID);
-
                     if (player == null || !player.isOnline()) {
-                        requestQueue.remove(playerUUID);
-                        initialLoadingPlayers.remove(playerUUID);
-                        initialChunksToProcess.remove(playerUUID);
-                        currentlyQueued.remove(playerUUID);
+                        cleanupPlayer(playerUUID);
                         continue;
                     }
                     
-                    if (queue == null || queue.isEmpty()) {
-                        continue; 
-                    }
-
-                    for (int i = 0; i < CHUNKS_PER_TICK && !queue.isEmpty(); i++) {
-                        Vector vec = queue.poll();
-                        if (vec != null) {
-                            World world = player.getWorld();
-                            int cx = vec.getBlockX();
-                            int cz = vec.getBlockZ();
-                            if (world.isChunkLoaded(cx, cz)) {
-                                processAndSendChunk(player, world.getChunkAt(cx, cz));
-                            } else {
-                                queue.add(vec); 
+                    Queue<Vector> queue = requestQueue.get(playerUUID);
+                    if (queue != null && !queue.isEmpty()) {
+                        for (int i = 0; i < CHUNKS_PER_TICK && !queue.isEmpty(); i++) {
+                            Vector vec = queue.poll();
+                            if (vec != null) {
+                                World world = player.getWorld();
+                                if (world.isChunkLoaded(vec.getBlockX(), vec.getBlockZ())) {
+                                    processAndSendChunk(player, world.getChunkAt(vec.getBlockX(), vec.getBlockZ()));
+                                } else {
+                                    queue.add(vec); 
+                                }
                             }
                         }
                     }
@@ -209,13 +204,9 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                 new BukkitRunnable() {
                     @Override
                     public void run() {
-                        if (!player.isOnline()) return;
-
-                        Set<Vector> queuedSet = currentlyQueued.get(player.getUniqueId());
-                        if (queuedSet != null) {
-                            queuedSet.remove(chunkVec);
+                        if (player.isOnline()) {
+                            checkIfInitialLoadComplete(player);
                         }
-                        checkIfInitialLoadComplete(player);
                     }
                 }.runTask(TuffX.this);
             }
@@ -224,18 +215,17 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
     private void checkIfInitialLoadComplete(Player player) {
         UUID playerId = player.getUniqueId();
-        
-        if (initialChunksToProcess.containsKey(playerId)) {
-            int remaining = initialChunksToProcess.compute(playerId, (k, v) -> (v == null) ? -1 : v - 1);
-            
+        AtomicInteger counter = initialChunksToProcess.get(playerId);
+
+        if (counter != null) {
+            int remaining = counter.decrementAndGet();
             logDebug("Player " + player.getName() + " finished a chunk. Remaining initial chunks: " + remaining);
             
             if (remaining <= 0) {
-                initialLoadingPlayers.remove(playerId); 
-                initialChunksToProcess.remove(playerId);
-                
-                player.sendPluginMessage(this, CHANNEL, createLoadFinishedPayload());
                 logDebug("INITIAL LOAD COMPLETE for " + player.getName() + ". Sent finished packet.");
+                player.sendPluginMessage(this, CHANNEL, createLoadFinishedPayload());
+                
+                initialChunksToProcess.remove(playerId);
             }
         }
     }
@@ -253,13 +243,15 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         }
     }
 
+    private void cleanupPlayer(UUID playerId) {
+        requestQueue.remove(playerId);
+        awaitingInitialBatch.remove(playerId);
+        initialChunksToProcess.remove(playerId);
+    }
+
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
-        UUID playerId = event.getPlayer().getUniqueId();
-        requestQueue.remove(playerId);
-        initialLoadingPlayers.remove(playerId);
-        currentlyQueued.remove(playerId);
-        initialChunksToProcess.remove(playerId);
+        cleanupPlayer(event.getPlayer().getUniqueId());
     }
     
     private byte[] createWelcomePayload(String message, int someNumber) {
