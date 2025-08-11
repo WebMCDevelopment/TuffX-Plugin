@@ -37,6 +37,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+
 import java.util.logging.Level;
 
 public class TuffX extends JavaPlugin implements Listener, PluginMessageListener {
@@ -54,6 +57,8 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
     private BukkitTask processorTask;
 
+    private Cache<WorldChunkKey, List<byte[]>> chunkPayloadCache;
+
     private boolean debug;
 
     private ExecutorService chunkProcessorPool;
@@ -61,6 +66,8 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     private void logDebug(String message) {
         if (debug) getLogger().log(Level.INFO, "[TuffX-Debug] " + message);
     }
+
+    public record WorldChunkKey(String worldName, int x, int z) {}
 
     @Override
     public void onEnable() {
@@ -70,6 +77,11 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         this.enabledWorlds = new HashSet<>(getConfig().getStringList("enabled-worlds"));
         
         logDebug("TuffX will be active in the following worlds: " + String.join(", ", this.enabledWorlds));
+
+        this.chunkPayloadCache = CacheBuilder.newBuilder()
+            .maximumSize(getConfig().getInt("cache-size", 512))
+            .expireAfterAccess(getConfig().getInt("cache-expiration", 5), TimeUnit.MINUTES)
+            .build();
 
         getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
         getServer().getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
@@ -223,23 +235,52 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                     }
                     
                     Queue<Vector> queue = requestQueue.get(playerUUID);
-                    if (queue != null && !queue.isEmpty()) {
-                        for (int i = 0; i < CHUNKS_PER_TICK && !queue.isEmpty(); i++) {
-                            Vector vec = queue.poll();
-                            if (vec != null) {
-                                World world = player.getWorld();
-                                if (world.isChunkLoaded(vec.getBlockX(), vec.getBlockZ())) {
-                                    processAndSendChunk(player, world.getChunkAt(vec.getBlockX(), vec.getBlockZ()));
-                                } else {
-                                    world.loadChunk(vec.getBlockX(), vec.getBlockZ(), true);
-                                    queue.add(vec); 
-                                }
+                    if (queue == null) continue;
+
+                    for (int i = 0; i < CHUNKS_PER_TICK && !queue.isEmpty(); i++) {
+                        Vector vec = queue.poll();
+                        if (vec != null) {
+                            World world = player.getWorld();
+                            WorldChunkKey key = new WorldChunkKey(world.getName(), vec.getBlockX(), vec.getBlockZ());
+
+                            List<byte[]> cachedData = chunkPayloadCache.getIfPresent(key);
+
+                            if (cachedData != null) {
+                                logDebug("Cache HIT for chunk: " + key);
+                                sendPayloadsToPlayer(player, cachedData);
+                                checkIfInitialLoadComplete(player);
+                            } else {
+                                logDebug("Cache MISS for chunk: " + key + ". Generating...");
+                                new BukkitRunnable() {
+                                    @Override
+                                    public void run() {
+                                        if (world.isChunkLoaded(key.x(), key.z())) {
+                                            processAndSendChunk(player, world.getChunkAt(key.x(), key.z()));
+                                        } else {
+                                            world.loadChunk(key.x(), key.z(), true);
+                                            processAndSendChunk(player, world.getChunkAt(key.x(), key.z()));
+                                        }
+                                    }
+                                }.runTaskAsynchronously(TuffX.this);
                             }
                         }
                     }
                 }
             }
         }.runTaskTimer(this, 0L, 1L);
+    }
+
+    private void sendPayloadsToPlayer(Player player, List<byte[]> payloads) {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (player.isOnline()) {
+                    for (byte[] payload : payloads) {
+                        player.sendPluginMessage(TuffX.this, CHANNEL, payload);
+                    }
+                }
+            }
+        }.runTask(this);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -249,25 +290,27 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
         Queue<Vector> playerQueue = requestQueue.get(playerId);
         if (playerQueue != null && !playerQueue.isEmpty()) {
-                logDebug("Player " + player.getName() + " changed worlds. Clearing " + playerQueue.size() + " pending chunk requests.");
-                playerQueue.clear();
-            }
-            
-            if (initialChunksToProcess.remove(playerId) != null) {
-                logDebug("Player " + player.getName() + " was in the middle of an initial chunk load. The process has been cancelled.");
-                awaitingInitialBatch.remove(playerId);
-                player.sendPluginMessage(this, CHANNEL, createLoadFinishedPayload());
-            }
-
-            player.sendPluginMessage(this, CHANNEL, createDimensionPayload());
-
-            player.sendPluginMessage(this, CHANNEL, createBelowY0StatusPayload(enabledWorlds.contains(player.getWorld().getName())));
+            logDebug("Player " + player.getName() + " changed worlds. Clearing " + playerQueue.size() + " pending chunk requests.");
+            playerQueue.clear();
+        }
+        
+        if (initialChunksToProcess.remove(playerId) != null) {
+            logDebug("Player " + player.getName() + " was in the middle of an initial chunk load. The process has been cancelled.");
+            awaitingInitialBatch.remove(playerId);
+            player.sendPluginMessage(this, CHANNEL, createLoadFinishedPayload());
         }
 
-        private void processAndSendChunk(final Player player, final Chunk chunk) {
+        player.sendPluginMessage(this, CHANNEL, createDimensionPayload());
+
+        player.sendPluginMessage(this, CHANNEL, createBelowY0StatusPayload(enabledWorlds.contains(player.getWorld().getName())));
+    }
+
+    private void processAndSendChunk(final Player player, final Chunk chunk) {
         if (chunk == null || !player.isOnline() || chunkProcessorPool.isShutdown()) {
             return;
         }
+
+        final WorldChunkKey key = new WorldChunkKey(chunk.getWorld().getName(), chunk.getX(), chunk.getZ());
 
         chunkProcessorPool.submit(() -> {
             final List<byte[]> processedPayloads = new ArrayList<>();
@@ -288,6 +331,8 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                 }
             }
 
+            chunkPayloadCache.put(key, processedPayloads);
+
             new BukkitRunnable() {
                 @Override
                 public void run() {
@@ -300,6 +345,12 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                 }
             }.runTask(this);
         });
+    }
+
+    private void invalidateChunkCache(World world, int blockX, int blockZ) {
+        WorldChunkKey key = new WorldChunkKey(world.getName(), blockX >> 4, blockZ >> 4);
+        chunkPayloadCache.invalidate(key);
+        logDebug("Invalidated cache for chunk: " + key);
     }
 
     private void checkIfInitialLoadComplete(Player player) {
@@ -405,11 +456,29 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
 
     
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockBreak(BlockBreakEvent event) { if (event.getBlock().getY() < 0) handleBlockChange(event.getBlock().getLocation(), event.getBlock().getBlockData(), Material.AIR.createBlockData()); }
+    public void onBlockBreak(BlockBreakEvent event) { 
+        if (event.getBlock().getY() < 0) {
+            handleBlockChange(event.getBlock().getLocation(), event.getBlock().getBlockData(), Material.AIR.createBlockData()); 
+            invalidateChunkCache(event.getBlock().getWorld(), event.getBlock().getX(), event.getBlock().getZ());
+        }
+    }
+
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPlace(BlockPlaceEvent event) { if (event.getBlock().getY() < 0) handleBlockChange(event.getBlock().getLocation(), event.getBlockReplacedState().getBlockData(), event.getBlock().getBlockData()); }
+    public void onBlockPlace(BlockPlaceEvent event) { 
+        if (event.getBlock().getY() < 0) {
+            handleBlockChange(event.getBlock().getLocation(), event.getBlockReplacedState().getBlockData(), event.getBlock().getBlockData()); 
+            invalidateChunkCache(event.getBlock().getWorld(), event.getBlock().getX(), event.getBlock().getZ());
+        }
+    }
+
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPhysics(BlockPhysicsEvent event) { Block block = event.getBlock(); if (block.getY() < 0) sendSingleBlockUpdate(block.getLocation(), block.getBlockData());sendLightingUpdate(block.getLocation()); }
+    public void onBlockPhysics(BlockPhysicsEvent event) { 
+        Block block = event.getBlock(); 
+        if (block.getY() < 0) {
+            sendSingleBlockUpdate(block.getLocation(), block.getBlockData());sendLightingUpdate(block.getLocation()); 
+            invalidateChunkCache(block.getWorld(), block.getX(), block.getZ());
+        }
+    }
 
     private void sendSingleBlockUpdate(Location loc, BlockData data) {
         try (ByteArrayOutputStream bout = new ByteArrayOutputStream(64);

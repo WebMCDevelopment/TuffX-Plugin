@@ -11,3 +11,8 @@ enabled-worlds:
 #the amount of threads for the chunk processor to use - using more threads processes chunks faster, but increases CPU usage
 #-1 is automatic
 chunk-processor-threads: -1
+
+#the size of the cache
+cache-size: 512
+#how long until the cache expires (minutes)
+cache-expiration: 5
