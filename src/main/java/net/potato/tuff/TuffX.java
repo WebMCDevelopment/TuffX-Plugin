@@ -24,6 +24,8 @@ import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 import org.bukkit.event.block.BlockPhysicsEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.event.block.BlockExplodeEvent;
+import org.bukkit.event.block.BlockFromToEvent;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 
 import java.util.concurrent.ExecutorService;
@@ -67,7 +69,7 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     private final ThreadLocal<short[]> threadLocalBlockArray = ThreadLocal.withInitial(() -> new short[4096]);
     private final ThreadLocal<byte[]> threadLocalLightArray = ThreadLocal.withInitial(() -> new byte[4096]);
     private final ThreadLocal<ByteArrayOutputStream> threadLocalOutStream = ThreadLocal.withInitial(() -> new ByteArrayOutputStream(8256));
-    private final Set<WorldChunkKey> pendingChunkLoads = ConcurrentHashMap.newKeySet();
+    private final Set<WorldChunkKey> pendingGeneration = ConcurrentHashMap.newKeySet();
 
     private void logDebug(String message) {
         if (debug) getLogger().log(Level.INFO, "[TuffX-Debug] " + message);
@@ -252,6 +254,12 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                                 World world = player.getWorld();
 
                                 WorldChunkKey key = new WorldChunkKey(world.getName(), vec.getBlockX(), vec.getBlockZ());
+
+                                if (pendingGeneration.contains(key)) {
+                                    queue.add(vec);
+                                    continue;
+                                }
+
                                 List<byte[]> cachedData = chunkPayloadCache.getIfPresent(key);
                                 if (cachedData != null) {
                                     sendPayloadsToPlayer(player, cachedData);
@@ -263,7 +271,20 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
                                     processAndSendChunk(player, world.getChunkAt(vec.getBlockX(), vec.getBlockZ()));
                                 } else {
                                     world.loadChunk(vec.getBlockX(), vec.getBlockZ(), true);
-                                    queue.add(vec); 
+                                    pendingGeneration.add(key);
+                                    
+                                    new BukkitRunnable() {
+                                        @Override
+                                        public void run() {
+                                            if (player.isOnline() && world.isChunkLoaded(vec.getBlockX(), vec.getBlockZ())) {
+                                                processAndSendChunk(player, world.getChunkAt(vec.getBlockX(), vec.getBlockZ()));
+                                            } else {
+                                                logDebug("Chunk " + key + " was not ready after delay, re-queueing.");
+                                                queue.add(vec);
+                                            }
+                                            pendingGeneration.remove(key); 
+                                        }
+                                    }.runTaskLater(TuffX.this, 5L); 
                                 }
                             }
                         }
@@ -477,39 +498,85 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPhysics(BlockPhysicsEvent event) { 
-        Block block = event.getBlock(); 
+    public void onBlockPhysics(BlockPhysicsEvent event) {
+        final Block block = event.getBlock();
         if (block.getY() < 0) {
-            sendSingleBlockUpdate(block.getLocation(), block.getBlockData());
-            //sendLightingUpdate(block.getLocation()); 
-            invalidateChunkCache(block.getWorld(), block.getX(), block.getZ());
+            final Location loc = block.getLocation();
+            final World world = loc.getWorld();
+
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    BlockData updatedData = world.getBlockData(loc);
+                    sendSingleBlockUpdate(loc, updatedData);
+                    invalidateChunkCache(world, loc.getBlockX(), loc.getBlockZ());
+                }
+            }.runTask(this);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockExplode(BlockExplodeEvent event) {
+        final Set<WorldChunkKey> affectedChunks = new HashSet<>();
+        final List<Block> blocksToUpdate = new ArrayList<>(event.blockList());
+
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                for (Block block : blocksToUpdate) {
+                    if (block.getY() < 0) {
+                        sendSingleBlockUpdate(block.getLocation(), Material.AIR.createBlockData());
+                        affectedChunks.add(new WorldChunkKey(block.getWorld().getName(), block.getX() >> 4, block.getZ() >> 4));
+                    }
+                }
+
+                if (!affectedChunks.isEmpty()) {
+                    logDebug("Explosion updated " + affectedChunks.size() + " chunks below y=0.");
+                    affectedChunks.forEach(chunkPayloadCache::invalidate);
+                }
+            }
+        }.runTask(this);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockFromTo(BlockFromToEvent event) {
+        final Block block = event.getToBlock();
+
+        if (block.getY() < 0) {
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    sendSingleBlockUpdate(block.getLocation(), block.getBlockData());
+                    invalidateChunkCache(block.getWorld(), block.getX(), block.getZ());
+                }
+            }.runTask(this);
         }
     }
 
     private void sendSingleBlockUpdate(Location loc, BlockData data) {
         try (ByteArrayOutputStream bout = new ByteArrayOutputStream(64);
             DataOutputStream out = new DataOutputStream(bout)) {
-            
+
             out.writeUTF("block_update");
             out.writeInt(loc.getBlockX());
             out.writeInt(loc.getBlockY());
             out.writeInt(loc.getBlockZ());
-            
+
             int[] legacyData = viablockids.toLegacy(data);
             out.writeShort((short) ((legacyData[1] << 12) | (legacyData[0] & 0xFFF)));
-            
+
             byte[] payload = bout.toByteArray();
-            
+
             new BukkitRunnable() {
                 @Override
                 public void run() {
                     for (Player p : loc.getWorld().getPlayers()) {
-                        if (p.getLocation().distanceSquared(loc) < 4096) { 
+                        if (p.getLocation().distanceSquared(loc) < 4096) {
                             p.sendPluginMessage(TuffX.this, CHANNEL, payload);
                         }
                     }
                 }
-            }.runTaskAsynchronously(this);
+            }.runTask(this);
 
         } catch (IOException e) {
             getLogger().severe("Failed to create single block update payload: " + e.getMessage());
