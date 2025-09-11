@@ -23,266 +23,314 @@ import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 import org.bukkit.event.block.BlockPhysicsEvent;
-import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.block.BlockFromToEvent;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-
+import java.util.concurrent.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.ConcurrentLinkedQueue;
-
-import com.google.common.cache.Cache;
-import com.google.common.cache.CacheBuilder;
-
+import com.google.common.cache.*;
 import java.util.logging.Level;
+import it.unimi.dsi.fastutil.objects.*;
+import it.unimi.dsi.fastutil.ints.*;
+import it.unimi.dsi.fastutil.shorts.*;
+import it.unimi.dsi.fastutil.bytes.*;
 
 public class TuffX extends JavaPlugin implements Listener, PluginMessageListener {
 
-    public static final String CHANNEL = "eagler:below_y0";
-    public ViaBlockIds viablockids;
+    public static final String CH = "eagler:below_y0";
+    public ViaBlockIds v;
 
-    private static int CHUNKS_PER_TICK;
+    private static int CPT;
 
-    private final Map<UUID, Queue<Vector>> requestQueue = new ConcurrentHashMap<>();
+    private final Object2ObjectOpenHashMap<UUID, ObjectArrayList<Vector>> rq = new Object2ObjectOpenHashMap<>();
     
-    private final Set<UUID> awaitingInitialBatch = ConcurrentHashMap.newKeySet();
-    private final Map<UUID, AtomicInteger> initialChunksToProcess = new ConcurrentHashMap<>();
-    private Set<String> enabledWorlds;
+    private final ObjectOpenHashSet<UUID> aib = new ObjectOpenHashSet<>();
+    private final Object2ObjectOpenHashMap<UUID, AtomicInteger> icp = new Object2ObjectOpenHashMap<>();
+    private ObjectOpenHashSet<String> ew;
 
-    private BukkitTask processorTask;
+    private BukkitTask pt;
 
-    private Cache<WorldChunkKey, List<byte[]>> chunkPayloadCache;
+    private Cache<WCK, ObjectArrayList<byte[]>> cc;
 
-    private boolean debug;
+    private boolean d;
 
-    private ExecutorService chunkProcessorPool;
+    private ExecutorService cp;
 
-    private final ThreadLocal<Map<BlockData, int[]>> threadLocalConversionCache = ThreadLocal.withInitial(HashMap::new);
-    private final ThreadLocal<short[]> threadLocalBlockArray = ThreadLocal.withInitial(() -> new short[4096]);
-    private final ThreadLocal<byte[]> threadLocalLightArray = ThreadLocal.withInitial(() -> new byte[4096]);
-    private final ThreadLocal<ByteArrayOutputStream> threadLocalOutStream = ThreadLocal.withInitial(() -> new ByteArrayOutputStream(8256));
-    private final Set<WorldChunkKey> pendingGeneration = ConcurrentHashMap.newKeySet();
+    private final ThreadLocal<Object2ObjectOpenHashMap<BlockData, int[]>> tlcc = ThreadLocal.withInitial(() -> new Object2ObjectOpenHashMap<>(256));
+    private final ThreadLocal<ShortArrayList> tlba = ThreadLocal.withInitial(() -> new ShortArrayList(4096));
+    private final ThreadLocal<ByteArrayList> tlla = ThreadLocal.withInitial(() -> new ByteArrayList(4096));
+    private final ThreadLocal<ByteArrayOutputStream> tlos = ThreadLocal.withInitial(() -> new ByteArrayOutputStream(8256));
+    private final ObjectOpenHashSet<WCK> pg = new ObjectOpenHashSet<>();
+    
+    private static final int[] EMPTY_LEGACY = {1, 0};
+    private static final byte[] EMPTY_PAYLOAD = new byte[0];
+    private static final ObjectArrayList<byte[]> EMPTY_PAYLOAD_LIST = new ObjectArrayList<>(0);
 
-    private void logDebug(String message) {
-        if (debug) getLogger().log(Level.INFO, "[TuffX-Debug] " + message);
+    private void ld(String m) {
+        if (d) getLogger().log(Level.INFO, "[TuffX-Debug] " + m);
     }
 
-    public record WorldChunkKey(String worldName, int x, int z) {}
+    public record WCK(String w, int x, int z) {}
 
     @Override
     public void onEnable() {
-        //System.out.println("UPDATED!!!");
         saveDefaultConfig();
-        //saveResource("version.json", true);
-        this.CHUNKS_PER_TICK = getConfig().getInt("chunks-per-tick", 6);
-        this.debug = getConfig().getBoolean("debug-mode", false);
-        this.enabledWorlds = new HashSet<>(getConfig().getStringList("enabled-worlds"));
+        CPT = getConfig().getInt("chunks-per-tick", 6);
+        d = getConfig().getBoolean("debug-mode", false);
+        ObjectArrayList<String> ewList = new ObjectArrayList<>(getConfig().getStringList("enabled-worlds"));
+        ew = new ObjectOpenHashSet<>(ewList.size());
+        ew.addAll(ewList);
         
-        logDebug("TuffX will be active in the following worlds: " + String.join(", ", this.enabledWorlds));
+        ld("TuffX will be active in the following worlds: " + String.join(", ", ew));
 
-        this.chunkPayloadCache = CacheBuilder.newBuilder()
-            .maximumSize(getConfig().getInt("cache-size", 512))
+        cc = CacheBuilder.newBuilder()
+            .maximumSize(getConfig().getInt("cache-size", 1024))
             .expireAfterAccess(getConfig().getInt("cache-expiration", 5), TimeUnit.MINUTES)
+            .concurrencyLevel(Runtime.getRuntime().availableProcessors())
+            .initialCapacity(256)
             .build();
 
-        getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
-        getServer().getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
+        getServer().getMessenger().registerOutgoingPluginChannel(this, CH);
+        getServer().getMessenger().registerIncomingPluginChannel(this, CH, this);
         getServer().getPluginManager().registerEvents(this, this);
-        if (this.viablockids == null) this.viablockids = new ViaBlockIds(this);
-        logFancyEnable();
+        if (v == null) v = new ViaBlockIds(this);
+        lfe();
 
-        int configuredThreads = getConfig().getInt("chunk-processor-threads", -1);
-        int threadCount;
-        if (configuredThreads <= 0) {
-            threadCount = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2));
-            logDebug("Auto-detected and using " + threadCount + " threads for the chunk processor pool.");
+        int ct = getConfig().getInt("chunk-processor-threads", -1);
+        int tc;
+        if (ct <= 0) {
+            tc = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+            ld("Auto-detected and using " + tc + " threads for the chunk processor pool.");
         } else {
-            threadCount = configuredThreads;
-            getLogger().info("Using user-configured thread count of " + threadCount + " for the chunk processor pool.");
+            tc = ct;
+            getLogger().info("Using user-configured thread count of " + tc + " for the chunk processor pool.");
         }
         
-        this.chunkProcessorPool = Executors.newFixedThreadPool(threadCount);
+        cp = Executors.newFixedThreadPool(tc, r -> {
+            Thread t = new Thread(r, "TuffX-Chunk-" + System.nanoTime());
+            t.setDaemon(true);
+            t.setPriority(Thread.NORM_PRIORITY + 1);
+            return t;
+        });
 
-        startProcessorTask();
+        spt();
 
         new Updater(this).scheduleCheck();
     }
 
-    public record ChunkSectionCoord(int cx, int cy, int cz) {}
+    public record CSC(int x, int y, int z) {}
 
     @Override
     public void onDisable() {
-        if (processorTask != null) processorTask.cancel();
+        if (pt != null) {
+            pt.cancel();
+            pt = null;
+        }
 
-        if (chunkProcessorPool != null) {
-            chunkProcessorPool.shutdown();
+        if (cp != null) {
+            cp.shutdown();
             try {
-                if (!chunkProcessorPool.awaitTermination(5, TimeUnit.SECONDS)) {
+                if (!cp.awaitTermination(10, TimeUnit.SECONDS)) {
                     getLogger().warning("Chunk processor pool did not shut down cleanly, forcing shutdown.");
-                    chunkProcessorPool.shutdownNow();
+                    cp.shutdownNow();
+                    if (!cp.awaitTermination(5, TimeUnit.SECONDS)) {
+                        getLogger().severe("Failed to shutdown chunk processor pool!");
+                    }
                 }
             } catch (InterruptedException e) {
-                chunkProcessorPool.shutdownNow();
+                cp.shutdownNow();
                 Thread.currentThread().interrupt();
+            } finally {
+                cp = null;
             }
         }
 
-        requestQueue.clear();
-        awaitingInitialBatch.clear();
-        initialChunksToProcess.clear();
-        getLogger().info("TuffX has been disabled.");
+        if (cc != null) {
+            cc.invalidateAll();
+            cc = null;
+        }
+
+        rq.clear();
+        aib.clear();
+        icp.clear();
+        pg.clear();
+        
+        if (v != null) {
+            v = null;
+        }
+        
+        getLogger().info("TuffX has been disabled and cleaned up.");
     }
 
     @Override
-    public void onPluginMessageReceived(String channel, Player player, byte[] message) {
-        if (!channel.equals(CHANNEL) || !player.isOnline()) return;
-        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(message))) {
-            int x = in.readInt();
-            int y = in.readInt();
-            int z = in.readInt();
-            int actionLength = in.readUnsignedByte();
-            byte[] actionBytes = new byte[actionLength];
-            in.readFully(actionBytes);
-            String action = new String(actionBytes, StandardCharsets.UTF_8);
-            handleIncomingPacket(player, new Location(player.getWorld(), x, y, z), action, x, z, in);
+    public void onPluginMessageReceived(String ch, Player p, byte[] m) {
+        if (!ch.equals(CH) || !p.isOnline()) return;
+        try (DataInputStream i = new DataInputStream(new ByteArrayInputStream(m))) {
+            int x = i.readInt();
+            int y = i.readInt();
+            int z = i.readInt();
+            int al = i.readUnsignedByte();
+            byte[] ab = new byte[al];
+            i.readFully(ab);
+            String a = new String(ab, StandardCharsets.UTF_8);
+            hip(p, new Location(p.getWorld(), x, y, z), a, x, z, i);
         } catch (IOException e) {
-            getLogger().warning("Failed to parse plugin message from " + player.getName() + ": " + e.getMessage());
+            getLogger().warning("Failed to parse plugin message from " + p.getName() + ": " + e.getMessage());
         }
     }
 
-    private void handleSingleChunkRequest(Player player, int chunkX, int chunkZ, UUID playerId) {
-        requestQueue.computeIfAbsent(player.getUniqueId(), k -> new ConcurrentLinkedQueue<>()).add(new Vector(chunkX, 0, chunkZ));
+    private void hscr(Player p, int x, int z, UUID id) {
+        ObjectArrayList<Vector> q = rq.get(id);
+        if (q == null) {
+            q = new ObjectArrayList<>(64);
+            rq.put(id, q);
+        }
+        synchronized (q) {
+            q.add(new Vector(x, 0, z));
+        }
     }
     
-    private void handleIncomingPacket(Player player, Location loc, String action, int chunkX, int chunkZ, DataInputStream in) throws IOException {
-        UUID playerId = player.getUniqueId();
+    private void hip(Player p, Location l, String a, int x, int z, DataInputStream i) throws IOException {
+        UUID id = p.getUniqueId();
 
-        if (!enabledWorlds.contains(player.getWorld().getName())) {
-            if (awaitingInitialBatch.contains(playerId)) player.sendPluginMessage(this, CHANNEL, createLoadFinishedPayload());
+        if (!ew.contains(p.getWorld().getName())) {
+            if (aib.contains(id)) p.sendPluginMessage(this, CH, clfp());
             return;
         }
 
-        switch (action.toLowerCase()) {
+        switch (a.toLowerCase()) {
             case "request_chunk":
-                handleSingleChunkRequest(player,chunkX,chunkZ,playerId);
+                hscr(p, x, z, id);
                 break;
             case "request_chunk_batch":
-                if (awaitingInitialBatch.remove(playerId)) {
-                    int batchSize = in.readInt();
-                    logDebug("Received definitive initial batch of " + batchSize + " chunks. Queueing for processing.");
+                if (aib.remove(id)) {
+                    int bs = i.readInt();
+                    ld("Received definitive initial batch of " + bs + " chunks. Queueing for processing.");
 
-                    initialChunksToProcess.put(playerId, new AtomicInteger(batchSize));
+                    icp.put(id, new AtomicInteger(bs));
                     
-                    Queue<Vector> playerQueue = requestQueue.computeIfAbsent(playerId, k -> new ConcurrentLinkedQueue<>());
-                    for (int i = 0; i < batchSize; i++) {
-                        playerQueue.add(new Vector(in.readInt(), 0, in.readInt()));
+                    ObjectArrayList<Vector> pq = rq.get(id);
+                    if (pq == null) {
+                        pq = new ObjectArrayList<>(Math.max(64, bs));
+                        rq.put(id, pq);
+                    }
+                    synchronized (pq) {
+                        pq.ensureCapacity(pq.size() + bs);
+                        for (int j = 0; j < bs; j++) {
+                            pq.add(new Vector(i.readInt(), 0, i.readInt()));
+                        }
                     }
 
-                    if (batchSize == 0) {
-                        checkIfInitialLoadComplete(player);
+                    if (bs == 0) {
+                        cilc(p);
                     }
                 } else {
-                    int batchSize = in.readInt();
-                    Queue<Vector> playerQueue = requestQueue.computeIfAbsent(playerId, k -> new ConcurrentLinkedQueue<>());
-                    for (int i = 0; i < batchSize; i++) {
-                        playerQueue.add(new Vector(in.readInt(), 0, in.readInt()));
+                    int bs = i.readInt();
+                    ObjectArrayList<Vector> pq = rq.get(id);
+                    if (pq == null) {
+                        pq = new ObjectArrayList<>(Math.max(64, bs));
+                        rq.put(id, pq);
+                    }
+                    synchronized (pq) {
+                        pq.ensureCapacity(pq.size() + bs);
+                        for (int j = 0; j < bs; j++) {
+                            pq.add(new Vector(i.readInt(), 0, i.readInt()));
+                        }
                     }
                 }
                 break;
             case "ready":
-                logDebug("Player " + player.getName() + " is READY. Awaiting first chunk batch...");
-                if (enabledWorlds.contains(player.getWorld().getName())) {
-                    awaitingInitialBatch.add(player.getUniqueId());
-                    player.sendPluginMessage(this, CHANNEL, createBelowY0StatusPayload(true));
+                ld("Player " + p.getName() + " is READY. Awaiting first chunk batch...");
+                if (ew.contains(p.getWorld().getName())) {
+                    aib.add(p.getUniqueId());
+                    p.sendPluginMessage(this, CH, cby0sp(true));
                 } else {
-                    logDebug("Not a supported world!");
-                    player.sendPluginMessage(this, CHANNEL, createBelowY0StatusPayload(false));
+                    ld("Not a supported world!");
+                    p.sendPluginMessage(this, CH, cby0sp(false));
                 }
                 break;
             case "use_on_block":
                 new BukkitRunnable() {
                     @Override
                     public void run() {
-                        Block block = loc.getBlock();
-                        ItemStack item = player.getInventory().getItemInMainHand();
-                        getServer().getPluginManager().callEvent(new PlayerInteractEvent(player, Action.RIGHT_CLICK_BLOCK, item, block, block.getFace(player.getLocation().getBlock())));
+                        Block b = l.getBlock();
+                        ItemStack it = p.getInventory().getItemInMainHand();
+                        getServer().getPluginManager().callEvent(new PlayerInteractEvent(p, Action.RIGHT_CLICK_BLOCK, it, b, b.getFace(p.getLocation().getBlock())));
                     }
                 }.runTask(this);
                 break;
         }
     }
 
-    private byte[] createBelowY0StatusPayload(boolean status) {
-        try (ByteArrayOutputStream bout = new ByteArrayOutputStream(); DataOutputStream out = new DataOutputStream(bout)) {
-            out.writeUTF("belowy0_status");
-            out.writeBoolean(status);
-            return bout.toByteArray();
+    private byte[] cby0sp(boolean s) {
+        try (ByteArrayOutputStream b = new ByteArrayOutputStream(); DataOutputStream o = new DataOutputStream(b)) {
+            o.writeUTF("belowy0_status");
+            o.writeBoolean(s);
+            return b.toByteArray();
         } catch (IOException e) { return null; }
     }
 
-    private byte[] createDimensionPayload() {
-        try (ByteArrayOutputStream bout = new ByteArrayOutputStream(); DataOutputStream out = new DataOutputStream(bout)) {
-            out.writeUTF("dimension_change");
-            return bout.toByteArray();
+    private byte[] cdp() {
+        try (ByteArrayOutputStream b = new ByteArrayOutputStream(); DataOutputStream o = new DataOutputStream(b)) {
+            o.writeUTF("dimension_change");
+            return b.toByteArray();
         } catch (IOException e) { return null; }
     }
     
-    private void startProcessorTask() {
-        this.processorTask = new BukkitRunnable() {
+    private void spt() {
+        pt = new BukkitRunnable() {
             @Override
             public void run() {
-                for (UUID playerUUID : new HashSet<>(requestQueue.keySet())) {
-                    Player player = getServer().getPlayer(playerUUID);
-                    if (player == null || !player.isOnline()) {
-                        cleanupPlayer(playerUUID);
+                ObjectOpenHashSet<UUID> keys = new ObjectOpenHashSet<>(rq.keySet());
+                for (UUID u : keys) {
+                    Player p = getServer().getPlayer(u);
+                    if (p == null || !p.isOnline()) {
+                        cp(u);
                         continue;
                     }
                     
-                    Queue<Vector> queue = requestQueue.get(playerUUID);
-                    if (queue != null && !queue.isEmpty()) {
-                        for (int i = 0; i < CHUNKS_PER_TICK && !queue.isEmpty(); i++) {
-                            Vector vec = queue.poll();
-                            if (vec != null) {
-                                World world = player.getWorld();
+                    ObjectArrayList<Vector> q = rq.get(u);
+                    if (q != null && !q.isEmpty()) {
+                        synchronized (q) {
+                            int sz = Math.min(CPT, q.size());
+                            for (int i = 0; i < sz; i++) {
+                                Vector v = q.remove(q.size() - 1);
+                                World w = p.getWorld();
 
-                                WorldChunkKey key = new WorldChunkKey(world.getName(), vec.getBlockX(), vec.getBlockZ());
+                                WCK k = new WCK(w.getName(), v.getBlockX(), v.getBlockZ());
 
-                                if (pendingGeneration.contains(key)) {
-                                    queue.add(vec);
+                                if (pg.contains(k)) {
+                                    q.add(v);
                                     continue;
                                 }
 
-                                List<byte[]> cachedData = chunkPayloadCache.getIfPresent(key);
-                                if (cachedData != null) {
-                                    sendPayloadsToPlayer(player, cachedData);
-                                    checkIfInitialLoadComplete(player);
+                                ObjectArrayList<byte[]> cd = cc.getIfPresent(k);
+                                if (cd != null) {
+                                    sptp(p, cd);
+                                    cilc(p);
                                     continue;
                                 }
 
-                                if (world.isChunkLoaded(vec.getBlockX(), vec.getBlockZ())) {
-                                    processAndSendChunk(player, world.getChunkAt(vec.getBlockX(), vec.getBlockZ()));
+                                if (w.isChunkLoaded(v.getBlockX(), v.getBlockZ())) {
+                                    pasc(p, w.getChunkAt(v.getBlockX(), v.getBlockZ()));
                                 } else {
-                                    world.loadChunk(vec.getBlockX(), vec.getBlockZ(), true);
-                                    pendingGeneration.add(key);
+                                    w.loadChunk(v.getBlockX(), v.getBlockZ(), true);
+                                    pg.add(k);
                                     
                                     new BukkitRunnable() {
                                         @Override
                                         public void run() {
-                                            if (player.isOnline() && world.isChunkLoaded(vec.getBlockX(), vec.getBlockZ())) {
-                                                processAndSendChunk(player, world.getChunkAt(vec.getBlockX(), vec.getBlockZ()));
+                                            if (p.isOnline() && w.isChunkLoaded(v.getBlockX(), v.getBlockZ())) {
+                                                pasc(p, w.getChunkAt(v.getBlockX(), v.getBlockZ()));
                                             } else {
-                                                logDebug("Chunk " + key + " was not ready after delay, re-queueing.");
-                                                queue.add(vec);
+                                                ld("Chunk " + k + " was not ready after delay, re-queueing.");
+                                                q.add(v);
                                             }
-                                            pendingGeneration.remove(key); 
+                                            pg.remove(k); 
                                         }
                                     }.runTaskLater(TuffX.this, 5L); 
                                 }
@@ -294,13 +342,13 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         }.runTaskTimer(this, 0L, 1L);
     }
 
-    private void sendPayloadsToPlayer(Player player, List<byte[]> payloads) {
+    private void sptp(Player p, ObjectArrayList<byte[]> pl) {
         new BukkitRunnable() {
             @Override
             public void run() {
-                if (player.isOnline()) {
-                    for (byte[] payload : payloads) {
-                        player.sendPluginMessage(TuffX.this, CHANNEL, payload);
+                if (p.isOnline()) {
+                    for (byte[] py : pl) {
+                        p.sendPluginMessage(TuffX.this, CH, py);
                     }
                 }
             }
@@ -308,271 +356,279 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
-    public void onPlayerChangeWorld(PlayerChangedWorldEvent event) {
-        Player player = event.getPlayer();
-        UUID playerId = player.getUniqueId();
+    public void onPlayerChangeWorld(PlayerChangedWorldEvent e) {
+        Player p = e.getPlayer();
+        UUID id = p.getUniqueId();
 
-        Queue<Vector> playerQueue = requestQueue.get(playerId);
-        if (playerQueue != null && !playerQueue.isEmpty()) {
-            logDebug("Player " + player.getName() + " changed worlds. Clearing " + playerQueue.size() + " pending chunk requests.");
-            playerQueue.clear();
+        ObjectArrayList<Vector> pq = rq.get(id);
+        if (pq != null && !pq.isEmpty()) {
+            ld("Player " + p.getName() + " changed worlds. Clearing " + pq.size() + " pending chunk requests.");
+            synchronized (pq) {
+                pq.clear();
+            }
         }
         
-        if (initialChunksToProcess.remove(playerId) != null) {
-            logDebug("Player " + player.getName() + " was in the middle of an initial chunk load. The process has been cancelled.");
-            awaitingInitialBatch.remove(playerId);
-            player.sendPluginMessage(this, CHANNEL, createLoadFinishedPayload());
+        if (icp.remove(id) != null) {
+            ld("Player " + p.getName() + " was in the middle of an initial chunk load. The process has been cancelled.");
+            aib.remove(id);
+            p.sendPluginMessage(this, CH, clfp());
         }
 
-        player.sendPluginMessage(this, CHANNEL, createDimensionPayload());
+        p.sendPluginMessage(this, CH, cdp());
 
-        player.sendPluginMessage(this, CHANNEL, createBelowY0StatusPayload(enabledWorlds.contains(player.getWorld().getName())));
+        p.sendPluginMessage(this, CH, cby0sp(ew.contains(p.getWorld().getName())));
     }
 
-    private void processAndSendChunk(final Player player, final Chunk chunk) {
-        if (chunk == null || !player.isOnline() || chunkProcessorPool.isShutdown()) {
+    private void pasc(final Player p, final Chunk c) {
+        if (c == null || p == null || !p.isOnline() || cp == null || cp.isShutdown()) {
             return;
         }
 
-        final WorldChunkKey key = new WorldChunkKey(chunk.getWorld().getName(), chunk.getX(), chunk.getZ());
+        final WCK k = new WCK(c.getWorld().getName(), c.getX(), c.getZ());
 
-        chunkProcessorPool.submit(() -> {
-            final List<byte[]> processedPayloads = new ArrayList<>();
-            final ChunkSnapshot snapshot = chunk.getChunkSnapshot(true, false, false);
-            final Map<BlockData, int[]> conversionCache = threadLocalConversionCache.get();
-            conversionCache.clear(); 
+        cp.submit(() -> {
+            final ObjectArrayList<byte[]> pp = new ObjectArrayList<>(4);
+            final ChunkSnapshot s = c.getChunkSnapshot(true, false, false);
+            final Object2ObjectOpenHashMap<BlockData, int[]> cvt = tlcc.get();
+            cvt.clear(); 
 
-            for (int sectionY = -4; sectionY < 0; sectionY++) {
-                if (!player.isOnline()) {
+            for (int sy = -4; sy < 0; sy++) {
+                if (!p.isOnline()) {
                     return;
                 }
                 try {
-                    byte[] payload = createSectionPayload(snapshot, chunk.getX(), chunk.getZ(), sectionY, conversionCache);
-                    if (payload != null) {
-                        processedPayloads.add(payload);
+                    byte[] py = csp(s, c.getX(), c.getZ(), sy, cvt);
+                    if (py != null) {
+                        pp.add(py);
                     }
                 } catch (IOException e) {
-                    getLogger().severe("Payload creation failed for " + chunk.getX() + "," + chunk.getZ() + ": " + e.getMessage());
+                    getLogger().severe("Payload creation failed for " + c.getX() + "," + c.getZ() + ": " + e.getMessage());
                 }
             }
 
-            chunkPayloadCache.put(key, processedPayloads);
+            TuffX.this.cc.put(k, pp);
 
             new BukkitRunnable() {
                 @Override
                 public void run() {
-                    if (player.isOnline()) {
-                        for (byte[] payload : processedPayloads) {
-                            player.sendPluginMessage(TuffX.this, CHANNEL, payload);
+                    if (p.isOnline()) {
+                        for (byte[] py : pp) {
+                            p.sendPluginMessage(TuffX.this, CH, py);
                         }
-                        checkIfInitialLoadComplete(player);
+                        cilc(p);
                     }
                 }
-            }.runTask(this);
+            }.runTask(TuffX.this);
         });
     }
 
-    private void checkIfInitialLoadComplete(Player player) {
-        UUID playerId = player.getUniqueId();
-        AtomicInteger counter = initialChunksToProcess.get(playerId);
+    private void cilc(Player p) {
+        UUID id = p.getUniqueId();
+        AtomicInteger ct = icp.get(id);
 
-        if (counter != null) {
-            int remaining = counter.decrementAndGet();
-            logDebug("Player " + player.getName() + " finished a chunk. Remaining initial chunks: " + remaining);
+        if (ct != null) {
+            int r = ct.decrementAndGet();
+            ld("Player " + p.getName() + " finished a chunk. Remaining initial chunks: " + r);
             
-            if (remaining <= 0) {
-                logDebug("INITIAL LOAD COMPLETE for " + player.getName() + ". Sent finished packet.");
-                player.sendPluginMessage(this, CHANNEL, createLoadFinishedPayload());
+            if (r <= 0) {
+                ld("INITIAL LOAD COMPLETE for " + p.getName() + ". Sent finished packet.");
+                p.sendPluginMessage(this, CH, clfp());
                 
-                initialChunksToProcess.remove(playerId);
+                icp.remove(id);
             }
         }
     }
 
-    private void invalidateChunkCache(World world, int blockX, int blockZ) {
-        WorldChunkKey key = new WorldChunkKey(world.getName(), blockX >> 4, blockZ >> 4);
-        chunkPayloadCache.invalidate(key);
-        logDebug("Invalidated cache for chunk: " + key);
+    private void icc(World w, int x, int z) {
+        WCK k = new WCK(w.getName(), x >> 4, z >> 4);
+        cc.invalidate(k);
+        ld("Invalidated cache for chunk: " + k);
     }
 
-    private byte[] createLoadFinishedPayload() {
-        try (ByteArrayOutputStream bout = new ByteArrayOutputStream(); 
-            DataOutputStream out = new DataOutputStream(bout)) {
+    private byte[] clfp() {
+        try (ByteArrayOutputStream b = new ByteArrayOutputStream(); 
+            DataOutputStream o = new DataOutputStream(b)) {
             
-            out.writeUTF("y0_load_finished");
+            o.writeUTF("y0_load_finished");
             
-            return bout.toByteArray();
+            return b.toByteArray();
         } catch (IOException e) {
             getLogger().severe("Failed to create the y0_load_finished payload!");
             return null;
         }
     }
 
-    private void cleanupPlayer(UUID playerId) {
-        requestQueue.remove(playerId);
-        awaitingInitialBatch.remove(playerId);
-        initialChunksToProcess.remove(playerId);
+    private void cp(UUID id) {
+        rq.remove(id);
+        aib.remove(id);
+        icp.remove(id);
     }
 
     @EventHandler
-    public void onPlayerQuit(PlayerQuitEvent event) {
-        cleanupPlayer(event.getPlayer().getUniqueId());
+    public void onPlayerQuit(PlayerQuitEvent e) {
+        cp(e.getPlayer().getUniqueId());
     }
     
-    private byte[] createWelcomePayload(String message, int someNumber) {
-        try (ByteArrayOutputStream bout = new ByteArrayOutputStream(); DataOutputStream out = new DataOutputStream(bout)) {
-            out.writeUTF("welcome_data");
-            out.writeUTF(message);
-            out.writeInt(someNumber);
-            return bout.toByteArray();
+    private byte[] cwp(String m, int n) {
+        try (ByteArrayOutputStream b = new ByteArrayOutputStream(); DataOutputStream o = new DataOutputStream(b)) {
+            o.writeUTF("welcome_data");
+            o.writeUTF(m);
+            o.writeInt(n);
+            return b.toByteArray();
         } catch (IOException e) { return null; }
     }
     
-    private byte[] createSectionPayload(ChunkSnapshot snapshot, int cx, int cz, int sectionY, Map<BlockData, int[]> cache) throws IOException {
-        short[] blockDataArray = threadLocalBlockArray.get();
-        byte[] lightDataArray = threadLocalLightArray.get();
+    private byte[] csp(ChunkSnapshot s, int x, int z, int sy, Object2ObjectOpenHashMap<BlockData, int[]> c) throws IOException {
+        ShortArrayList ba = tlba.get();
+        ByteArrayList la = tlla.get();
+        ba.clear();
+        la.clear();
+        ba.ensureCapacity(4096);
+        la.ensureCapacity(4096);
         
-        boolean hasAnythingToSend = false;
-        int baseY = sectionY * 16;
-        int index = 0;
+        boolean h = false;
+        int by = sy << 4;
 
         for (int y = 0; y < 16; y++) {
-            for (int z = 0; z < 16; z++) {
-                for (int x = 0; x < 16; x++) {
-                    int worldY = baseY + y;
-                    
-                    BlockData blockData = snapshot.getBlockData(x, worldY, z);
-                    int[] legacyData = cache.computeIfAbsent(blockData, viablockids::toLegacy);
-                    
-                    short legacyBlock = (short) ((legacyData[1] << 12) | (legacyData[0] & 0xFFF));
-                    byte packedLight = (byte) ((snapshot.getBlockSkyLight(x, worldY, z) << 4) | snapshot.getBlockEmittedLight(x, worldY, z));
-
-                    blockDataArray[index] = legacyBlock;
-                    lightDataArray[index] = packedLight;
-
-                    if (legacyBlock != 0 || packedLight != 0) {
-                        hasAnythingToSend = true;
+            int wy = by + y;
+            for (int zz = 0; zz < 16; zz++) {
+                for (int xx = 0; xx < 16; xx++) {
+                    BlockData bd = s.getBlockData(xx, wy, zz);
+                    int[] ld = c.getOrDefault(bd, EMPTY_LEGACY);
+                    if (ld == EMPTY_LEGACY && v != null) {
+                        ld = v.toLegacy(bd);
+                        c.put(bd, ld);
                     }
-                    index++;
+                    
+                    short lb = (short) ((ld[1] << 12) | (ld[0] & 0xFFF));
+                    byte pl = (byte) ((s.getBlockSkyLight(xx, wy, zz) << 4) | s.getBlockEmittedLight(xx, wy, zz));
+
+                    ba.add(lb);
+                    la.add(pl);
+
+                    if (lb != 0 || pl != 0) {
+                        h = true;
+                    }
                 }
             }
         }
 
-        if (!hasAnythingToSend) {
+        if (!h) {
             return null;
         }
 
-        ByteArrayOutputStream bout = threadLocalOutStream.get();
-        bout.reset(); 
+        ByteArrayOutputStream b = tlos.get();
+        b.reset(); 
         
-        try (DataOutputStream out = new DataOutputStream(bout)) {
-            out.writeUTF("chunk_data");
-            out.writeInt(cx);
-            out.writeInt(cz);
-            out.writeInt(sectionY);
+        try (DataOutputStream o = new DataOutputStream(b)) {
+            o.writeUTF("chunk_data");
+            o.writeInt(x);
+            o.writeInt(z);
+            o.writeInt(sy);
 
-            for (int i = 0; i < 4096; i++) {
-                out.writeShort(blockDataArray[i]);
-                out.writeByte(lightDataArray[i]);
+            int sz = ba.size();
+            for (int j = 0; j < sz; j++) {
+                o.writeShort(ba.getShort(j));
+                o.writeByte(la.getByte(j));
             }
             
-            return bout.toByteArray();
+            return b.toByteArray();
         }
     }
 
     
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockBreak(BlockBreakEvent event) { 
-        if (event.getBlock().getY() < 0) {
-            handleBlockChange(event.getBlock().getLocation(), event.getBlock().getBlockData(), Material.AIR.createBlockData()); 
-            invalidateChunkCache(event.getBlock().getWorld(), event.getBlock().getX(), event.getBlock().getZ());
+    public void onBlockBreak(BlockBreakEvent e) { 
+        if (e.getBlock().getY() < 0) {
+            hbc(e.getBlock().getLocation(), e.getBlock().getBlockData(), Material.AIR.createBlockData()); 
+            icc(e.getBlock().getWorld(), e.getBlock().getX(), e.getBlock().getZ());
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPlace(BlockPlaceEvent event) { 
-        if (event.getBlock().getY() < 0) {
-            handleBlockChange(event.getBlock().getLocation(), event.getBlockReplacedState().getBlockData(), event.getBlock().getBlockData()); 
-            invalidateChunkCache(event.getBlock().getWorld(), event.getBlock().getX(), event.getBlock().getZ());
+    public void onBlockPlace(BlockPlaceEvent e) { 
+        if (e.getBlock().getY() < 0) {
+            hbc(e.getBlock().getLocation(), e.getBlockReplacedState().getBlockData(), e.getBlock().getBlockData()); 
+            icc(e.getBlock().getWorld(), e.getBlock().getX(), e.getBlock().getZ());
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPhysics(BlockPhysicsEvent event) {
-        final Block block = event.getBlock();
-        if (block.getY() < 0) {
-            final Location loc = block.getLocation();
-            final World world = loc.getWorld();
+    public void onBlockPhysics(BlockPhysicsEvent e) {
+        final Block b = e.getBlock();
+        if (b.getY() < 0) {
+            final Location l = b.getLocation();
+            final World w = l.getWorld();
 
             new BukkitRunnable() {
                 @Override
                 public void run() {
-                    BlockData updatedData = world.getBlockData(loc);
-                    sendSingleBlockUpdate(loc, updatedData);
-                    invalidateChunkCache(world, loc.getBlockX(), loc.getBlockZ());
+                    BlockData ud = w.getBlockData(l);
+                    ssbu(l, ud);
+                    icc(w, l.getBlockX(), l.getBlockZ());
                 }
             }.runTask(this);
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockExplode(BlockExplodeEvent event) {
-        final Set<WorldChunkKey> affectedChunks = new HashSet<>();
-        final List<Block> blocksToUpdate = new ArrayList<>(event.blockList());
+    public void onBlockExplode(BlockExplodeEvent e) {
+        final ObjectOpenHashSet<WCK> ac = new ObjectOpenHashSet<>();
+        final List<Block> btu = new ArrayList<>(e.blockList());
 
         new BukkitRunnable() {
             @Override
             public void run() {
-                for (Block block : blocksToUpdate) {
-                    if (block.getY() < 0) {
-                        sendSingleBlockUpdate(block.getLocation(), Material.AIR.createBlockData());
-                        affectedChunks.add(new WorldChunkKey(block.getWorld().getName(), block.getX() >> 4, block.getZ() >> 4));
+                for (Block b : btu) {
+                    if (b.getY() < 0) {
+                        ssbu(b.getLocation(), Material.AIR.createBlockData());
+                        ac.add(new WCK(b.getWorld().getName(), b.getX() >> 4, b.getZ() >> 4));
                     }
                 }
 
-                if (!affectedChunks.isEmpty()) {
-                    logDebug("Explosion updated " + affectedChunks.size() + " chunks below y=0.");
-                    affectedChunks.forEach(chunkPayloadCache::invalidate);
+                if (!ac.isEmpty()) {
+                    ld("Explosion updated " + ac.size() + " chunks below y=0.");
+                    ac.forEach(cc::invalidate);
                 }
             }
         }.runTask(this);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockFromTo(BlockFromToEvent event) {
-        final Block block = event.getToBlock();
+    public void onBlockFromTo(BlockFromToEvent e) {
+        final Block b = e.getToBlock();
 
-        if (block.getY() < 0) {
+        if (b.getY() < 0) {
             new BukkitRunnable() {
                 @Override
                 public void run() {
-                    sendSingleBlockUpdate(block.getLocation(), block.getBlockData());
-                    invalidateChunkCache(block.getWorld(), block.getX(), block.getZ());
+                    ssbu(b.getLocation(), b.getBlockData());
+                    icc(b.getWorld(), b.getX(), b.getZ());
                 }
             }.runTask(this);
         }
     }
 
-    private void sendSingleBlockUpdate(Location loc, BlockData data) {
-        try (ByteArrayOutputStream bout = new ByteArrayOutputStream(64);
-            DataOutputStream out = new DataOutputStream(bout)) {
+    private void ssbu(Location l, BlockData d) {
+        try (ByteArrayOutputStream b = new ByteArrayOutputStream(64);
+            DataOutputStream o = new DataOutputStream(b)) {
 
-            out.writeUTF("block_update");
-            out.writeInt(loc.getBlockX());
-            out.writeInt(loc.getBlockY());
-            out.writeInt(loc.getBlockZ());
+            o.writeUTF("block_update");
+            o.writeInt(l.getBlockX());
+            o.writeInt(l.getBlockY());
+            o.writeInt(l.getBlockZ());
 
-            int[] legacyData = viablockids.toLegacy(data);
-            out.writeShort((short) ((legacyData[1] << 12) | (legacyData[0] & 0xFFF)));
+            int[] ld = v.toLegacy(d);
+            o.writeShort((short) ((ld[1] << 12) | (ld[0] & 0xFFF)));
 
-            byte[] payload = bout.toByteArray();
+            byte[] py = b.toByteArray();
 
             new BukkitRunnable() {
                 @Override
                 public void run() {
-                    for (Player p : loc.getWorld().getPlayers()) {
-                        if (p.getLocation().distanceSquared(loc) < 4096) {
-                            p.sendPluginMessage(TuffX.this, CHANNEL, payload);
+                    for (Player p : l.getWorld().getPlayers()) {
+                        if (p.getLocation().distanceSquared(l) < 4096) {
+                            p.sendPluginMessage(TuffX.this, CH, py);
                         }
                     }
                 }
@@ -583,52 +639,52 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         }
     }
 
-    private void handleBlockChange(Location loc, BlockData oldData, BlockData newData) {
-        sendSingleBlockUpdate(loc, newData);
+    private void hbc(Location l, BlockData od, BlockData nd) {
+        ssbu(l, nd);
 
-        boolean oldEmits = oldData.getLightEmission() > 0;
-        boolean newEmits = newData.getLightEmission() > 0;
-        boolean oldOccludes = oldData.getMaterial().isOccluding();
-        boolean newOccludes = newData.getMaterial().isOccluding();
+        boolean oe = od.getLightEmission() > 0;
+        boolean ne = nd.getLightEmission() > 0;
+        boolean oo = od.getMaterial().isOccluding();
+        boolean no = nd.getMaterial().isOccluding();
 
-        if (oldEmits != newEmits || oldOccludes != newOccludes) {
-            sendLightingUpdate(loc);
+        if (oe != ne || oo != no) {
+            slu(l);
         }
     }
 
-    private void sendLightingUpdate(Location loc) {
-        Set<ChunkSectionCoord> sectionsToUpdate = new HashSet<>();
-        World world = loc.getWorld();
+    private void slu(Location l) {
+        ObjectOpenHashSet<CSC> stu = new ObjectOpenHashSet<>();
+        World w = l.getWorld();
 
         for (int dx = -1; dx <= 1; dx++) {
             for (int dy = -1; dy <= 1; dy++) {
                 for (int dz = -1; dz <= 1; dz++) {
-                    Location neighbor = loc.clone().add(dx, dy, dz);
-                    if (neighbor.getY() < -64 || neighbor.getY() >= 0) continue;
+                    Location n = l.clone().add(dx, dy, dz);
+                    if (n.getY() < -64 || n.getY() >= 0) continue;
                     
-                    sectionsToUpdate.add(new ChunkSectionCoord(
-                        neighbor.getBlockX() >> 4, 
-                        neighbor.getBlockY() >> 4,
-                        neighbor.getBlockZ() >> 4 
+                    stu.add(new CSC(
+                        n.getBlockX() >> 4, 
+                        n.getBlockY() >> 4,
+                        n.getBlockZ() >> 4 
                     ));
                 }
             }
         }
 
-        for (ChunkSectionCoord sectionCoord : sectionsToUpdate) {
-            ChunkSnapshot snapshot = world.getChunkAt(sectionCoord.cx, sectionCoord.cz).getChunkSnapshot(true, false, false);
+        for (CSC sc : stu) {
+            ChunkSnapshot s = w.getChunkAt(sc.x, sc.z).getChunkSnapshot(true, false, false);
 
             new BukkitRunnable() {
                 @Override
                 public void run() {
                     try {
-                        byte[] payload = createLightingPayload(snapshot, sectionCoord);
+                        byte[] py = clp(s, sc);
                         new BukkitRunnable() {
                             @Override
                             public void run() {
-                                for (Player p : world.getPlayers()) {
-                                    if (p.getLocation().distanceSquared(loc) < 4096) {
-                                        p.sendPluginMessage(TuffX.this, CHANNEL, payload);
+                                for (Player p : w.getPlayers()) {
+                                    if (p.getLocation().distanceSquared(l) < 4096) {
+                                        p.sendPluginMessage(TuffX.this, CH, py);
                                     }
                                 }
                             }
@@ -641,36 +697,36 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
         }
     }
 
-    private byte[] createLightingPayload(ChunkSnapshot snapshot, ChunkSectionCoord section) throws IOException {
-        try (ByteArrayOutputStream bout = new ByteArrayOutputStream(4120); 
-            DataOutputStream out = new DataOutputStream(bout)) {
+    private byte[] clp(ChunkSnapshot s, CSC sc) throws IOException {
+        try (ByteArrayOutputStream b = new ByteArrayOutputStream(4120); 
+            DataOutputStream o = new DataOutputStream(b)) {
 
-            out.writeUTF("lighting_update");
-            out.writeInt(section.cx);
-            out.writeInt(section.cz);
-            out.writeInt(section.cy);
+            o.writeUTF("lighting_update");
+            o.writeInt(sc.x);
+            o.writeInt(sc.z);
+            o.writeInt(sc.y);
 
-            byte[] lightData = new byte[4096];
-            int baseY = section.cy * 16;
+            byte[] ld = new byte[4096];
+            int by = sc.y * 16;
             int i = 0;
 
             for (int y = 0; y < 16; y++) {
                 for (int z = 0; z < 16; z++) {
                     for (int x = 0; x < 16; x++) {
-                        int worldY = baseY + y;
-                        int blockLight = snapshot.getBlockEmittedLight(x, worldY, z);
-                        int skyLight = snapshot.getBlockSkyLight(x, worldY, z);
-                        lightData[i++] = (byte) ((skyLight << 4) | blockLight);
+                        int wy = by + y;
+                        int bl = s.getBlockEmittedLight(x, wy, z);
+                        int sl = s.getBlockSkyLight(x, wy, z);
+                        ld[i++] = (byte) ((sl << 4) | bl);
                     }
                 }
             }
             
-            out.write(lightData);
-            return bout.toByteArray();
+            o.write(ld);
+            return b.toByteArray();
         }
     }
 
-    private void logFancyEnable() {
+    private void lfe() {
         getLogger().info("");
         getLogger().info("████████╗██╗   ██╗███████╗ ███████╗ ██╗  ██╗");
         getLogger().info("╚══██╔══╝██║   ██║██╔════╝ ██╔════╝ ╚██╗██╔╝");

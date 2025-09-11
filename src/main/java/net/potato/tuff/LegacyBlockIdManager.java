@@ -2,44 +2,42 @@ package net.potato.tuff;
 
 import org.bukkit.Material;
 import org.bukkit.plugin.Plugin;
-
-import java.util.HashSet;
-import java.util.Set;
+import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 
 public class LegacyBlockIdManager {
 
-    private static final short[] ID_CACHE = new short[Material.values().length];
-    private static final Set<String> unmappedBlocks = new HashSet<>();
-    private static boolean initialized = false;
+    private static final short[] IC = new short[Material.values().length];
+    private static final ObjectOpenHashSet<String> UB = new ObjectOpenHashSet<>();
+    private static boolean I = false;
 
-    public static void initialize(Plugin plugin) {
-        if (initialized) return;
+    public static void initialize(Plugin p) {
+        if (I) return;
 
-        for (Material material : Material.values()) {
-            if (!material.isBlock()) {
-                ID_CACHE[material.ordinal()] = 0; // Air
+        for (Material m : Material.values()) {
+            if (!m.isBlock()) {
+                IC[m.ordinal()] = 0;
                 continue;
             }
 
-            String blockName = material.name().toLowerCase();
-            int id = LegacyBlockIds.BLOCK_ID_MAP.getOrDefault(blockName, -1);
-            int meta = LegacyBlockIds.BLOCK_META_MAP.getOrDefault(blockName, 0);
+            String bn = m.name().toLowerCase();
+            int id = LegacyBlockIds.BLOCK_ID_MAP.getOrDefault(bn, -1);
+            int mt = LegacyBlockIds.BLOCK_META_MAP.getOrDefault(bn, 0);
 
             if (id == -1) {
                 id = 1; 
-                if (unmappedBlocks.add(blockName)) {
-                    plugin.getLogger().warning("Unmapped block: " + blockName + ". Defaulting to stone (ID=1).");
+                if (UB.add(bn)) {
+                    p.getLogger().warning("Unmapped block: " + bn + ". Defaulting to stone (ID=1).");
                 }
             }
             
-            ID_CACHE[material.ordinal()] = (short) ((id & 0xFFF) | ((meta & 0xF) << 12));
+            IC[m.ordinal()] = (short) ((id & 0xFFF) | ((mt & 0xF) << 12));
         }
         
-        initialized = true;
-        plugin.getLogger().info("Legacy Block ID cache initialized successfully.");
+        I = true;
+        p.getLogger().info("Legacy Block ID cache initialized successfully.");
     }
 
-    public static short getLegacyShort(Material material) {
-        return ID_CACHE[material.ordinal()];
+    public static short getLegacyShort(Material m) {
+        return IC[m.ordinal()];
     }
 }

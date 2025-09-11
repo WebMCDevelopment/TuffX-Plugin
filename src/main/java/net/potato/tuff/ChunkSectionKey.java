@@ -3,67 +3,65 @@ package net.potato.tuff;
 import java.util.Objects;
 import java.util.UUID;
 
-// formats stuff to be good boy strings
-
 public final class ChunkSectionKey {
-    private final UUID playerId;
-    private final String worldName;
-    private final int cx;
-    private final int cz;
-    private final int sectionY;
+    private final UUID p;
+    private final String w;
+    private final int x;
+    private final int z;
+    private final int y;
 
-    public ChunkSectionKey(UUID playerId, String worldName, int cx, int cz, int sectionY) {
-        this.playerId = playerId;
-        this.worldName = worldName;
-        this.cx = cx;
-        this.cz = cz;
-        this.sectionY = sectionY;
+    public ChunkSectionKey(UUID p, String w, int x, int z, int y) {
+        this.p = p;
+        this.w = w;
+        this.x = x;
+        this.z = z;
+        this.y = y;
     }
 
-    public UUID playerId() {
-        return playerId;
+    public UUID p() {
+        return p;
     }
 
-    public String worldName() {
-        return worldName;
+    public String w() {
+        return w;
     }
 
-    public int cx() {
-        return cx;
+    public int x() {
+        return x;
     }
 
-    public int cz() {
-        return cz;
+    public int z() {
+        return z;
     }
 
-    public int sectionY() {
-        return sectionY;
+    public int y() {
+        return y;
     }
 
     @Override
-    public boolean equals(Object obj) {
-        if (obj == this) return true;
-        if (obj == null || obj.getClass() != this.getClass()) return false;
-        var that = (ChunkSectionKey) obj;
-        return Objects.equals(this.playerId, that.playerId) &&
-                Objects.equals(this.worldName, that.worldName) &&
-                this.cx == that.cx &&
-                this.cz == that.cz &&
-                this.sectionY == that.sectionY;
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (o == null || o.getClass() != this.getClass()) return false;
+        var t = (ChunkSectionKey) o;
+        return Objects.equals(p, t.p) &&
+                Objects.equals(w, t.w) &&
+                x == t.x &&
+                z == t.z &&
+                y == t.y;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(playerId, worldName, cx, cz, sectionY);
+        return Objects.hash(p, w, x, z, y);
     }
 
     @Override
     public String toString() {
         return "ChunkSectionKey[" +
-                "playerId=" + playerId + ", " +
-                "worldName=" + worldName + ", " +
-                "cx=" + cx + ", " +
-                "cz=" + cz + ", " +
-                "sectionY=" + sectionY + ']';
+                "p=" + p + ", " +
+                "w=" + w + ", " +
+                "x=" + x + ", " +
+                "z=" + z + ", " +
+                "y=" + y + ']';
     }
 }
