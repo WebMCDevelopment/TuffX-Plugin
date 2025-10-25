@@ -105,8 +105,6 @@ public class TuffX extends JavaPlugin implements Listener, PluginMessageListener
             t.setPriority(Thread.NORM_PRIORITY + 1);
             return t;
         });
-
-        new Updater(this).scheduleCheck();
     }
 
     public record CSC(int x, int y, int z) {}
